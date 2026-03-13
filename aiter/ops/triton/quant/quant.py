@@ -198,11 +198,28 @@ def dynamic_mxfp4_quant(
     if N <= 1024:
         NUM_ITER = 1
         NUM_STAGES = 1
-        NUM_WARPS = 4
-        BLOCK_SIZE_N = min(256, triton.next_power_of_2(N))
-        # BLOCK_SIZE_N needs to be multiple of 32
-        BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
-        BLOCK_SIZE_M = min(8, triton.next_power_of_2(M))
+
+        # Empirically tuned for common mxfp4-mm benchmark regimes.
+        # Keep blocks aligned to 32 for MXFP4 quant groups.
+        if M <= 4:
+            BLOCK_SIZE_M = 4
+            BLOCK_SIZE_N = min(512, triton.next_power_of_2(N))
+            BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
+            NUM_WARPS = 4 if BLOCK_SIZE_N >= 256 else 2
+        elif M <= 16:
+            BLOCK_SIZE_M = 8
+            BLOCK_SIZE_N = min(256, triton.next_power_of_2(N))
+            BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
+            NUM_WARPS = 2 if BLOCK_SIZE_N <= 64 else 4
+        elif M <= 32:
+            BLOCK_SIZE_M = 32
+            BLOCK_SIZE_N = 64 if N >= 64 else 32
+            NUM_WARPS = 2
+        else:
+            NUM_WARPS = 4
+            BLOCK_SIZE_N = min(256, triton.next_power_of_2(N))
+            BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
+            BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
 
     grid = (
         triton.cdiv(M, BLOCK_SIZE_M),
