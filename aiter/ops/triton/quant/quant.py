@@ -159,21 +159,18 @@ def dynamic_mxfp4_quant(
 
     # This is fixed by spec for MXFP4. Do not tune this.
     MXFP4_QUANT_BLOCK_SIZE = 32
-    x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
 
     if shuffle:
         scaleN = triton.cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
         scaleN_pad = triton.cdiv(scaleN, 8) * 8
         M_padded = triton.cdiv(M, 256) * 256
-        blockscale_shuffled = torch.full(
-            (M_padded * scaleN_pad,), 127, dtype=torch.uint8, device=x.device
+        x_fp4, blockscale_shuffled = _get_or_alloc_buffers(
+            M, N, x.device, True, MXFP4_QUANT_BLOCK_SIZE
         )
     else:
-        blockscale_e8m0 = torch.empty(
-            ((N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE, M),
-            dtype=torch.uint8,
-            device=x.device,
-        ).T
+        x_fp4, blockscale_e8m0 = _get_or_alloc_buffers(
+            M, N, x.device, False, MXFP4_QUANT_BLOCK_SIZE
+        )
 
     # for large N values
     if M <= 32:
