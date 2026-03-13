@@ -132,7 +132,7 @@ def dynamic_per_token_quant_fp8_i8(
 
 
 def dynamic_mxfp4_quant(
-    x: torch.Tensor, scaling_mode: str = "even"
+    x: torch.Tensor, scaling_mode: str = "even", shuffle: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format.
@@ -142,10 +142,15 @@ def dynamic_mxfp4_quant(
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
             - etc.
+        shuffle: If True, produce blockscale in the shuffled layout expected
+            by CK gemm_a4w4 (bpreshuffle=True), avoiding a separate
+            preshuffle_scales call.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
+        When shuffle=True, blockscale is returned in shuffled layout with
+        shape (M_padded, scaleN_pad) and dtype fp8_e8m0.
     """
-    _LOGGER.info(f"DYNAMIC_MXFP4_QUANT: x={tuple(x.shape)}")
+    _LOGGER.info(f"DYNAMIC_MXFP4_QUANT: x={tuple(x.shape)}, shuffle={shuffle}")
     # Assume x is 2D-Tensor for now
     M, N = x.shape
 
@@ -154,11 +159,22 @@ def dynamic_mxfp4_quant(
     # This is fixed by spec for MXFP4. Do not tune this.
     MXFP4_QUANT_BLOCK_SIZE = 32
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
-    blockscale_e8m0 = torch.empty(
-        ((N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE, M),
-        dtype=torch.uint8,
-        device=x.device,
-    ).T
+
+    if shuffle:
+        from aiter import dtypes
+
+        scaleN = triton.cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
+        scaleN_pad = triton.cdiv(scaleN, 8) * 8
+        M_padded = triton.cdiv(M, 256) * 256
+        blockscale_shuffled = torch.full(
+            (M_padded * scaleN_pad,), 127, dtype=torch.uint8, device=x.device
+        )
+    else:
+        blockscale_e8m0 = torch.empty(
+            ((N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE, M),
+            dtype=torch.uint8,
+            device=x.device,
+        ).T
 
     # for large N values
     if M <= 32:
@@ -193,24 +209,51 @@ def dynamic_mxfp4_quant(
         triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
     )
 
-    _dynamic_mxfp4_quant_kernel[grid](
-        x,
-        x_fp4,
-        blockscale_e8m0,
-        *x.stride(),
-        *x_fp4.stride(),
-        *blockscale_e8m0.stride(),
-        M=M,
-        N=N,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        SCALING_MODE=0,
-        NUM_ITER=NUM_ITER,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        NUM_STAGES=NUM_STAGES,
-        num_warps=NUM_WARPS,
-        waves_per_eu=0,
-        num_stages=1,
-    )
-
-    return (x_fp4, blockscale_e8m0)
+    if shuffle:
+        _dynamic_mxfp4_quant_kernel[grid](
+            x,
+            x_fp4,
+            blockscale_shuffled,
+            *x.stride(),
+            *x_fp4.stride(),
+            0, 0,  # bs strides unused in shuffle mode
+            M=M,
+            N=N,
+            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            SCALING_MODE=0,
+            SHUFFLE=True,
+            scaleN=scaleN,
+            scaleN_pad=scaleN_pad,
+            NUM_ITER=NUM_ITER,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_STAGES=NUM_STAGES,
+            num_warps=NUM_WARPS,
+            waves_per_eu=0,
+            num_stages=1,
+        )
+        return (
+            x_fp4.view(dtypes.fp4x2),
+            blockscale_shuffled.view(M_padded, scaleN_pad).view(dtypes.fp8_e8m0),
+        )
+    else:
+        _dynamic_mxfp4_quant_kernel[grid](
+            x,
+            x_fp4,
+            blockscale_e8m0,
+            *x.stride(),
+            *x_fp4.stride(),
+            *blockscale_e8m0.stride(),
+            M=M,
+            N=N,
+            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            SCALING_MODE=0,
+            NUM_ITER=NUM_ITER,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_STAGES=NUM_STAGES,
+            num_warps=NUM_WARPS,
+            waves_per_eu=0,
+            num_stages=1,
+        )
+        return (x_fp4, blockscale_e8m0)

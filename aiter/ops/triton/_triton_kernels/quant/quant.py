@@ -214,6 +214,9 @@ def _dynamic_mxfp4_quant_kernel(
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     EVEN_M_N: tl.constexpr,
     SCALING_MODE: tl.constexpr,
+    SHUFFLE: tl.constexpr = False,
+    scaleN: int = 0,
+    scaleN_pad: int = 0,
 ):
     pid_m = tl.program_id(0)
     start_n = tl.program_id(1) * NUM_ITER
@@ -258,15 +261,35 @@ def _dynamic_mxfp4_quant_kernel(
 
         bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
-        bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
-        if EVEN_M_N:
-            tl.store(bs_ptr + bs_offs, bs_e8m0)
+        if SHUFFLE:
+            # Compute shuffled layout indices for CK gemm_a4w4
+            d0 = bs_offs_m[:, None] // 32
+            d1 = (bs_offs_m[:, None] % 32) // 16
+            d2 = bs_offs_m[:, None] % 16
+            d3 = bs_offs_n[None, :] // 8
+            d4 = (bs_offs_n[None, :] % 8) // 4
+            d5 = bs_offs_n[None, :] % 4
+            shuffle_offs = (d0 * 2 * 16 * scaleN_pad
+                            + d3 * 2 * 2 * 16 * 4
+                            + d5 * 2 * 2 * 16
+                            + d2 * 2 * 2
+                            + d4 * 2
+                            + d1)
+            bs_valid_mask = (bs_offs_m[:, None] < M) & (bs_offs_n[None, :] < scaleN)
+            bs_val = tl.where(bs_valid_mask, bs_e8m0, tl.full(bs_e8m0.shape, 127, dtype=tl.uint8))
+            M_padded = ((M + 255) // 256) * 256
+            bs_pad_mask = (bs_offs_m[:, None] < M_padded) & (bs_offs_n[None, :] < scaleN_pad)
+            tl.store(bs_ptr + shuffle_offs, bs_val, mask=bs_pad_mask)
         else:
-            bs_mask = (bs_offs_m < M)[:, None] & (
-                bs_offs_n < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
-            )[None, :]
-            tl.store(
-                bs_ptr + bs_offs,
-                bs_e8m0,
-                mask=bs_mask,
-            )
+            bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
+            if EVEN_M_N:
+                tl.store(bs_ptr + bs_offs, bs_e8m0)
+            else:
+                bs_mask = (bs_offs_m < M)[:, None] & (
+                    bs_offs_n < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+                )[None, :]
+                tl.store(
+                    bs_ptr + bs_offs,
+                    bs_e8m0,
+                    mask=bs_mask,
+                )
