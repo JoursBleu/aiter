@@ -217,6 +217,7 @@ def _dynamic_mxfp4_quant_kernel(
     SHUFFLE: tl.constexpr = False,
     scaleN: int = 0,
     scaleN_pad: int = 0,
+    M_padded: int = 0,
 ):
     pid_m = tl.program_id(0)
     start_n = tl.program_id(1) * NUM_ITER
@@ -277,7 +278,6 @@ def _dynamic_mxfp4_quant_kernel(
                             + d1)
             bs_valid_mask = (bs_offs_m[:, None] < M) & (bs_offs_n[None, :] < scaleN)
             bs_val = tl.where(bs_valid_mask, bs_e8m0, tl.full(bs_e8m0.shape, 127, dtype=tl.uint8))
-            M_padded = ((M + 255) // 256) * 256
             bs_pad_mask = (bs_offs_m[:, None] < M_padded) & (bs_offs_n[None, :] < scaleN_pad)
             tl.store(bs_ptr + shuffle_offs, bs_val, mask=bs_pad_mask)
         else:

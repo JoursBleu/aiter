@@ -3,6 +3,7 @@
 
 import triton
 import torch
+from aiter import dtypes
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _static_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_tensor_quant_fp8_i8_kernel,
@@ -161,8 +162,6 @@ def dynamic_mxfp4_quant(
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
 
     if shuffle:
-        from aiter import dtypes
-
         scaleN = triton.cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
         scaleN_pad = triton.cdiv(scaleN, 8) * 8
         M_padded = triton.cdiv(M, 256) * 256
@@ -241,6 +240,7 @@ def dynamic_mxfp4_quant(
             SHUFFLE=True,
             scaleN=scaleN,
             scaleN_pad=scaleN_pad,
+            M_padded=M_padded,
             NUM_ITER=NUM_ITER,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
