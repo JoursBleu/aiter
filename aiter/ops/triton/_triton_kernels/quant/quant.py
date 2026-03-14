@@ -110,16 +110,14 @@ def _mxfp4_quant_op(
     amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
     # Round up to power-of-2 by clearing mantissa bits (set mantissa to 0)
     amax_u32 = (amax.to(tl.int32, bitcast=True) + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
-    # Extract exponent directly via bit shift (avoids tl.log2 + floor)
-    # fp32 exponent field: bits[30:23], biased by 127
+    # Extract exponent via bit shift and compute blockscale directly.
+    # bs_e8m0 = clamp(biased_exp - 2, 0, 254) where biased_exp = (amax_u32 >> 23) & 0xFF
     amax_exp = ((amax_u32 >> 23) & 0xFF).to(tl.int32)
-    # scale_e8m0_unbiased = exponent - 127 - 2 = exponent - 129
-    scale_e8m0_unbiased = tl.clamp(amax_exp - 129, min=-127, max=127)
+    bs_e8m0 = tl.clamp(amax_exp - 2, min=0, max=254).to(tl.uint8)
 
-    # blockscale_e8m0 = unbiased + 127
-    bs_e8m0 = (scale_e8m0_unbiased + 127).to(tl.uint8)
-
-    quant_scale = tl.exp2((-scale_e8m0_unbiased).to(tl.float32))
+    # Quantization scale: 2^(-(biased_exp - 129)) = 2^(129 - biased_exp)
+    # Derive from bs_e8m0 to avoid recomputing: unbiased = bs_e8m0 - 127
+    quant_scale = tl.exp2((127 - bs_e8m0.to(tl.int32)).to(tl.float32))
 
     # Compute quantized x
     qx = x * quant_scale
