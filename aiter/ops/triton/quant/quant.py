@@ -114,35 +114,42 @@ def _get_launch_config(M, N):
 
 
 def _get_or_alloc_buffers(M, N, device, shuffle, MXFP4_QUANT_BLOCK_SIZE=32):
-    """Return cached output buffers if shapes match, else allocate new ones."""
+    """Return cached output buffers and pre-computed views if shapes match.
+
+    For shuffle=True, returns (x_fp4, bs_flat, x_fp4_view, bs_view) where
+    views are pre-computed to avoid per-call view() overhead.
+    For shuffle=False, returns (x_fp4, bs).
+    """
     dev_idx = device.index if device.index is not None else 0
     key = (M, N, dev_idx, shuffle)
     cached = _buf_cache.get(key)
     if cached is not None:
-        # Padding positions retain 127 from initial allocation;
-        # the kernel writes tl.where(valid, data, 127) and stores with pad_mask,
-        # so padding cells that were set once are never changed.
-        # No re-fill needed — saves one GPU kernel launch per call.
         return cached
 
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=device)
     if shuffle:
-        scaleN = triton.cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
-        scaleN_pad = triton.cdiv(scaleN, 8) * 8
-        M_padded = triton.cdiv(M, 256) * 256
+        _cdiv = lambda a, b: (a + b - 1) // b
+        scaleN = _cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
+        scaleN_pad = _cdiv(scaleN, 8) * 8
+        M_padded = _cdiv(M, 256) * 256
         bs = torch.empty((M_padded * scaleN_pad,), dtype=torch.uint8, device=device)
         bs.fill_(127)
+        # Pre-compute views once (these share storage with the underlying tensors)
+        x_fp4_view = x_fp4.view(dtypes.fp4x2)
+        bs_view = bs.view(M_padded, scaleN_pad).view(dtypes.fp8_e8m0)
+        result = (x_fp4, bs, x_fp4_view, bs_view)
     else:
         bs = torch.empty(
             ((N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE, M),
             dtype=torch.uint8,
             device=device,
         ).T
+        result = (x_fp4, bs)
 
     # Evict previous entries to bound memory; keep only this key
     _buf_cache.clear()
-    _buf_cache[key] = (x_fp4, bs)
-    return x_fp4, bs
+    _buf_cache[key] = result
+    return result
 
 
 def static_per_tensor_quant_fp8_i8(
@@ -280,11 +287,12 @@ def dynamic_mxfp4_quant(
     # This is fixed by spec for MXFP4. Do not tune this.
     MXFP4_QUANT_BLOCK_SIZE = 32
 
+    _cdiv = lambda a, b: (a + b - 1) // b
     if shuffle:
-        scaleN = triton.cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
-        scaleN_pad = triton.cdiv(scaleN, 8) * 8
-        M_padded = triton.cdiv(M, 256) * 256
-        x_fp4, blockscale_shuffled = _get_or_alloc_buffers(
+        scaleN = _cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
+        scaleN_pad = _cdiv(scaleN, 8) * 8
+        M_padded = _cdiv(M, 256) * 256
+        x_fp4, blockscale_shuffled, x_fp4_view, bs_view = _get_or_alloc_buffers(
             M, N, x.device, True, MXFP4_QUANT_BLOCK_SIZE
         )
     else:
@@ -320,10 +328,7 @@ def dynamic_mxfp4_quant(
             waves_per_eu=0,
             num_stages=1,
         )
-        return (
-            x_fp4.view(dtypes.fp4x2),
-            blockscale_shuffled.view(M_padded, scaleN_pad).view(dtypes.fp8_e8m0),
-        )
+        return (x_fp4_view, bs_view)
     else:
         _dynamic_mxfp4_quant_kernel[grid](
             x,
