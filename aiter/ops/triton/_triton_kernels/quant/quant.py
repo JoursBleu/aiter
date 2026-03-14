@@ -255,10 +255,10 @@ def _dynamic_mxfp4_quant_kernel(
         )
 
         if EVEN_M_N:
-            tl.store(x_fp4_ptr + out_offs, out_tensor)
+            tl.store(x_fp4_ptr + out_offs, out_tensor, cache_modifier=".cs")
         else:
             out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
-            tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
+            tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask, cache_modifier=".cs")
 
         bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
@@ -280,11 +280,11 @@ def _dynamic_mxfp4_quant_kernel(
             bs_valid_mask = (bs_offs_m[:, None] < M) & (bs_offs_n[None, :] < scaleN)
             bs_val = tl.where(bs_valid_mask, bs_e8m0, tl.full(bs_e8m0.shape, 127, dtype=tl.uint8))
             bs_pad_mask = (bs_offs_m[:, None] < M_padded) & (bs_offs_n[None, :] < scaleN_pad)
-            tl.store(bs_ptr + shuffle_offs, bs_val, mask=bs_pad_mask)
+            tl.store(bs_ptr + shuffle_offs, bs_val, mask=bs_pad_mask, cache_modifier=".cs")
         else:
             bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
             if EVEN_M_N:
-                tl.store(bs_ptr + bs_offs, bs_e8m0)
+                tl.store(bs_ptr + bs_offs, bs_e8m0, cache_modifier=".cs")
             else:
                 bs_mask = (bs_offs_m < M)[:, None] & (
                     bs_offs_n < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
@@ -293,4 +293,5 @@ def _dynamic_mxfp4_quant_kernel(
                     bs_ptr + bs_offs,
                     bs_e8m0,
                     mask=bs_mask,
+                    cache_modifier=".cs",
                 )
