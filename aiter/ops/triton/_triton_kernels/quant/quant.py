@@ -263,18 +263,19 @@ def _dynamic_mxfp4_quant_kernel(
         bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
         if SHUFFLE:
-            # Compute shuffled layout indices for CK gemm_a4w4
-            d0 = bs_offs_m[:, None] // 32
-            d1 = (bs_offs_m[:, None] % 32) // 16
-            d2 = bs_offs_m[:, None] % 16
-            d3 = bs_offs_n[None, :] // 8
-            d4 = (bs_offs_n[None, :] % 8) // 4
-            d5 = bs_offs_n[None, :] % 4
-            shuffle_offs = (d0 * 2 * 16 * scaleN_pad
-                            + d3 * 2 * 2 * 16 * 4
-                            + d5 * 2 * 2 * 16
-                            + d2 * 2 * 2
-                            + d4 * 2
+            # Compute shuffled layout indices for CK gemm_a4w4 using
+            # bitwise ops (all divisors are powers of 2).
+            d0 = bs_offs_m[:, None] >> 5          # // 32
+            d1 = (bs_offs_m[:, None] >> 4) & 1    # (% 32) // 16
+            d2 = bs_offs_m[:, None] & 0xF          # % 16
+            d3 = bs_offs_n[None, :] >> 3           # // 8
+            d4 = (bs_offs_n[None, :] >> 2) & 1     # (% 8) // 4
+            d5 = bs_offs_n[None, :] & 3            # % 4
+            shuffle_offs = (d0 * (scaleN_pad << 5)
+                            + (d3 << 8)
+                            + (d5 << 6)
+                            + (d2 << 2)
+                            + (d4 << 1)
                             + d1)
             bs_valid_mask = (bs_offs_m[:, None] < M) & (bs_offs_n[None, :] < scaleN)
             bs_val = tl.where(bs_valid_mask, bs_e8m0, tl.full(bs_e8m0.shape, 127, dtype=tl.uint8))
