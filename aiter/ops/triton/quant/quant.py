@@ -28,6 +28,90 @@ _LOGGER = AiterTritonLogger()
 # Key: (M, N, device_index, shuffle); Value: (x_fp4, blockscale_or_shuffled)
 _buf_cache = {}
 
+# Launch config cache: pure-Python heuristic decisions cached by (M, N).
+_launch_config_cache = {}
+
+
+def _get_launch_config(M, N):
+    """Return (BLOCK_SIZE_M, BLOCK_SIZE_N, NUM_ITER, NUM_STAGES, NUM_WARPS, grid)."""
+    key = (M, N)
+    cached = _launch_config_cache.get(key)
+    if cached is not None:
+        return cached
+
+    # Inline cdiv and next_power_of_2 to avoid function call overhead.
+    def _cdiv(a, b):
+        return (a + b - 1) // b
+
+    def _np2(x):
+        p = 1
+        while p < x:
+            p <<= 1
+        return p
+
+    NUM_ITER = 1
+    NUM_STAGES = 1
+
+    if N <= 1024:
+        if M <= 4:
+            bm = 4
+            bn = min(512, _np2(N))
+            bn = max(32, bn)
+            nw = 4 if bn >= 256 else 2
+        elif M <= 16:
+            bm = 8
+            bn = min(256, _np2(N))
+            bn = max(32, bn)
+            nw = 2 if bn <= 64 else 4
+        elif M <= 32:
+            bm = 32
+            bn = 64 if N >= 64 else 32
+            nw = 2
+        else:
+            bm = min(32, _np2(M))
+            bn = min(256, _np2(N))
+            bn = max(32, bn)
+            nw = 4
+    elif N <= 4096:
+        if M <= 8:
+            bm = _np2(M)
+            bn = 128
+            nw = 4
+        elif M <= 32:
+            bm = _np2(M)
+            bn = 128
+            nw = 4
+        elif M <= 128:
+            bm = 32
+            bn = 128
+            nw = 4
+        else:
+            bm = 16
+            bn = 128
+            nw = 4
+    else:
+        if M <= 16:
+            bm = _np2(M)
+            bn = 128
+            nw = 4
+            NUM_ITER = 1
+        elif M <= 64:
+            bm = 32
+            bn = 128
+            nw = 4
+            NUM_ITER = 2
+        else:
+            bm = 32
+            bn = 128
+            nw = 4
+            NUM_ITER = 4
+            NUM_STAGES = 2
+
+    grid = (_cdiv(M, bm), _cdiv(N, bn * NUM_ITER))
+    result = (bm, bn, NUM_ITER, NUM_STAGES, nw, grid)
+    _launch_config_cache[key] = result
+    return result
+
 
 def _get_or_alloc_buffers(M, N, device, shuffle, MXFP4_QUANT_BLOCK_SIZE=32):
     """Return cached output buffers if shapes match, else allocate new ones."""
@@ -187,7 +271,7 @@ def dynamic_mxfp4_quant(
         When shuffle=True, blockscale is returned in shuffled layout with
         shape (M_padded, scaleN_pad) and dtype fp8_e8m0.
     """
-    _LOGGER.info(f"DYNAMIC_MXFP4_QUANT: x={tuple(x.shape)}, shuffle={shuffle}")
+    # _LOGGER.info removed: f-string formatting overhead in hot path
     # Assume x is 2D-Tensor for now
     M, N = x.shape
 
@@ -208,78 +292,9 @@ def dynamic_mxfp4_quant(
             M, N, x.device, False, MXFP4_QUANT_BLOCK_SIZE
         )
 
-    # ---- Launch config heuristics ----
-    # Tuned for MI350X (304 CUs). Goals:
-    # 1. Maximize CU occupancy (grid cells >= 304 ideal)
-    # 2. Minimize per-block overhead for small M
-    # 3. Block sizes must be multiples of 32 for MXFP4 quant group alignment on N
-    NUM_ITER = 1
-    NUM_STAGES = 1
-
-    if N <= 1024:
-        # Small N: single iteration, maximize parallelism.
-        if M <= 4:
-            BLOCK_SIZE_M = 4
-            BLOCK_SIZE_N = min(512, triton.next_power_of_2(N))
-            BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
-            NUM_WARPS = 4 if BLOCK_SIZE_N >= 256 else 2
-        elif M <= 16:
-            BLOCK_SIZE_M = 8
-            BLOCK_SIZE_N = min(256, triton.next_power_of_2(N))
-            BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
-            NUM_WARPS = 2 if BLOCK_SIZE_N <= 64 else 4
-        elif M <= 32:
-            BLOCK_SIZE_M = 32
-            BLOCK_SIZE_N = 64 if N >= 64 else 32
-            NUM_WARPS = 2
-        else:
-            BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
-            BLOCK_SIZE_N = min(256, triton.next_power_of_2(N))
-            BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
-            NUM_WARPS = 4
-    elif N <= 4096:
-        # Medium N (1024 < N <= 4096): balance block size and occupancy.
-        if M <= 8:
-            BLOCK_SIZE_M = triton.next_power_of_2(M)
-            BLOCK_SIZE_N = 128
-            NUM_WARPS = 4
-        elif M <= 32:
-            BLOCK_SIZE_M = triton.next_power_of_2(M)
-            BLOCK_SIZE_N = 128
-            NUM_WARPS = 4
-        elif M <= 128:
-            BLOCK_SIZE_M = 32
-            BLOCK_SIZE_N = 128
-            NUM_WARPS = 4
-        else:
-            # M>=256: use smaller BLOCK_SIZE_M for more grid_m parallelism
-            BLOCK_SIZE_M = 16
-            BLOCK_SIZE_N = 128
-            NUM_WARPS = 4
-    else:
-        # Large N (> 4096): balance iterations vs. CU occupancy.
-        if M <= 16:
-            BLOCK_SIZE_M = triton.next_power_of_2(M)
-            BLOCK_SIZE_N = 128
-            NUM_WARPS = 4
-            # Use single iteration to maximize grid_n for more CUs
-            NUM_ITER = 1
-        elif M <= 64:
-            BLOCK_SIZE_M = 32
-            BLOCK_SIZE_N = 128
-            NUM_WARPS = 4
-            NUM_ITER = 2
-        else:
-            BLOCK_SIZE_M = 32
-            BLOCK_SIZE_N = 128
-            NUM_WARPS = 4
-            NUM_ITER = 4
-            NUM_STAGES = 2
-
-    grid = (
-        triton.cdiv(M, BLOCK_SIZE_M),
-        triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
-    )
+    # Cached launch config — avoids repeated Python branching and triton.cdiv calls.
+    BLOCK_SIZE_M, BLOCK_SIZE_N, NUM_ITER, NUM_STAGES, NUM_WARPS, grid = \
+        _get_launch_config(M, N)
 
     if shuffle:
         _dynamic_mxfp4_quant_kernel[grid](
