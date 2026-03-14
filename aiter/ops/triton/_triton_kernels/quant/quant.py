@@ -170,14 +170,13 @@ def _mxfp4_quant_op(
     normal_x = normal_x >> (MBITS_F32 - MBITS_FP4)
     normal_x = normal_x.to(tl.uint8)
 
-    # Merge results
-    e2m1_value = tl.full(qx.type.get_block_shapes(), 0x7, dtype=tl.uint8)
+    # Merge 3 paths: saturate (0x7), normal, denormal.
+    # Fused: normal > denormal > saturate priority via chained select.
+    e2m1_value = tl.where(denormal_mask, denormal_x,
+                          tl.full(qx.type.get_block_shapes(), 0x7, dtype=tl.uint8))
     e2m1_value = tl.where(normal_mask, normal_x, e2m1_value)
-    e2m1_value = tl.where(denormal_mask, denormal_x, e2m1_value)
-    # add sign back
-    sign_lp = s >> (MBITS_F32 + EBITS_F32 - MBITS_FP4 - EBITS_FP4)
-    sign_lp = sign_lp.to(tl.uint8)
-    e2m1_value = e2m1_value | sign_lp
+    # Add sign back (shift sign bit from fp32 position to fp4 position)
+    e2m1_value = e2m1_value | (s >> 28).to(tl.uint8)
     e2m1_value = tl.reshape(
         e2m1_value, [BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2]
     )
