@@ -113,7 +113,7 @@ def _mxfp4_quant_op(
     # Extract exponent via bit shift and compute blockscale directly.
     # bs_e8m0 = clamp(biased_exp - 2, 0, 254) where biased_exp = (amax_u32 >> 23) & 0xFF
     amax_exp = ((amax_u32 >> 23) & 0xFF).to(tl.int32)
-    bs_e8m0 = tl.clamp(amax_exp - 2, min=0, max=254).to(tl.uint8)
+    bs_e8m0 = tl.minimum(tl.maximum(amax_exp - 2, 0), 254).to(tl.uint8)
 
     # Quantization scale: 2^(-(biased_exp - 129)) = 2^(129 - biased_exp)
     # Derive from bs_e8m0 to avoid recomputing: unbiased = bs_e8m0 - 127
