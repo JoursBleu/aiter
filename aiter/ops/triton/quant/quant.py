@@ -208,31 +208,16 @@ def dynamic_mxfp4_quant(
             M, N, x.device, False, MXFP4_QUANT_BLOCK_SIZE
         )
 
-    # for large N values
-    if M <= 32:
-        NUM_ITER = 1
-        BLOCK_SIZE_M = triton.next_power_of_2(M)
-        BLOCK_SIZE_N = 32
-        NUM_WARPS = 1
-        NUM_STAGES = 1
-    else:
-        NUM_ITER = 4
-        BLOCK_SIZE_M = 64
-        BLOCK_SIZE_N = 64
-        NUM_WARPS = 4
-        NUM_STAGES = 2
+    # ---- Launch config heuristics ----
+    # Tuned for MI350X (304 CUs). Goals:
+    # 1. Maximize CU occupancy (grid cells >= 304 ideal)
+    # 2. Minimize per-block overhead for small M
+    # 3. Block sizes must be multiples of 32 for MXFP4 quant group alignment on N
+    NUM_ITER = 1
+    NUM_STAGES = 1
 
-        if N <= 16384:
-            BLOCK_SIZE_M = 32
-            BLOCK_SIZE_N = 128
-
-    # for small N values
     if N <= 1024:
-        NUM_ITER = 1
-        NUM_STAGES = 1
-
-        # Empirically tuned for common mxfp4-mm benchmark regimes.
-        # Keep blocks aligned to 32 for MXFP4 quant groups.
+        # Small N: single iteration, maximize parallelism.
         if M <= 4:
             BLOCK_SIZE_M = 4
             BLOCK_SIZE_N = min(512, triton.next_power_of_2(N))
@@ -248,10 +233,48 @@ def dynamic_mxfp4_quant(
             BLOCK_SIZE_N = 64 if N >= 64 else 32
             NUM_WARPS = 2
         else:
-            NUM_WARPS = 4
+            BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
             BLOCK_SIZE_N = min(256, triton.next_power_of_2(N))
             BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
-            BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
+            NUM_WARPS = 4
+    elif N <= 4096:
+        # Medium N (1024 < N <= 4096): balance block size and occupancy.
+        if M <= 8:
+            BLOCK_SIZE_M = triton.next_power_of_2(M)
+            BLOCK_SIZE_N = 128
+            NUM_WARPS = 4
+        elif M <= 32:
+            BLOCK_SIZE_M = triton.next_power_of_2(M)
+            BLOCK_SIZE_N = 128
+            NUM_WARPS = 4
+        elif M <= 128:
+            BLOCK_SIZE_M = 32
+            BLOCK_SIZE_N = 128
+            NUM_WARPS = 4
+        else:
+            # M>=256: use smaller BLOCK_SIZE_M for more grid_m parallelism
+            BLOCK_SIZE_M = 16
+            BLOCK_SIZE_N = 128
+            NUM_WARPS = 4
+    else:
+        # Large N (> 4096): balance iterations vs. CU occupancy.
+        if M <= 16:
+            BLOCK_SIZE_M = triton.next_power_of_2(M)
+            BLOCK_SIZE_N = 128
+            NUM_WARPS = 4
+            # Use single iteration to maximize grid_n for more CUs
+            NUM_ITER = 1
+        elif M <= 64:
+            BLOCK_SIZE_M = 32
+            BLOCK_SIZE_N = 128
+            NUM_WARPS = 4
+            NUM_ITER = 2
+        else:
+            BLOCK_SIZE_M = 32
+            BLOCK_SIZE_N = 128
+            NUM_WARPS = 4
+            NUM_ITER = 4
+            NUM_STAGES = 2
 
     grid = (
         triton.cdiv(M, BLOCK_SIZE_M),
